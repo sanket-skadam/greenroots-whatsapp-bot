@@ -1064,64 +1064,74 @@ async function resetWhatsAppAuth(): Promise<void> {
 }
 
 async function startWhatsAppBot(): Promise<void> {
-  fs.mkdirSync(config.authDir, { recursive: true });
-  const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
-  const { version } = await fetchLatestBaileysVersion();
+  try {
+    fs.mkdirSync(config.authDir, { recursive: true });
+    const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
+    const { version } = await fetchLatestBaileysVersion();
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    markOnlineOnConnect: false,
-  });
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({ level: 'silent' }),
+      markOnlineOnConnect: false,
+    });
 
-  activeSocket = sock;
+    activeSocket = sock;
 
-  sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
-      waStatus.qr = qr;
-      waStatus.connected = false;
-      console.log('\n[GreenRoots Bot] Scan this QR code with WhatsApp (Linked Devices) or open /qr:');
-      qrcode.generate(qr, { small: true });
-    }
-
-    if (connection === 'close') {
-      const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
-      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-      waStatus.connected = false;
-      waStatus.lastDisconnectReason = statusCode ? `code ${statusCode}` : 'closed';
-      console.log(`[WhatsApp] Disconnected (${waStatus.lastDisconnectReason}). Logged out: ${isLoggedOut}`);
-
-      if (isResettingAuth) return;
-
-      if (isLoggedOut) {
-        console.log('[WhatsApp] Session logged out. Clearing auth and generating a fresh QR...');
-        setTimeout(() => {
-          void resetWhatsAppAuth();
-        }, 2000);
-      } else {
-        setTimeout(() => {
-          void startWhatsAppBot();
-        }, 2000);
+      if (qr) {
+        waStatus.qr = qr;
+        waStatus.connected = false;
+        console.log('\n[GreenRoots Bot] Scan this QR code with WhatsApp (Linked Devices) or open /qr:');
+        qrcode.generate(qr, { small: true });
       }
-    } else if (connection === 'open') {
-      waStatus.connected = true;
-      waStatus.qr = null;
-      waStatus.lastDisconnectReason = null;
-      console.log('✅ [GreenRoots Bot] Connected to WhatsApp WebSocket!');
-    }
-  });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    for (const msg of messages) {
-      await handleIncomingMessage(sock, msg);
-    }
-  });
+      if (connection === 'close') {
+        const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+        waStatus.connected = false;
+        waStatus.lastDisconnectReason = statusCode ? `code ${statusCode}` : 'closed';
+        console.log(`[WhatsApp] Disconnected (${waStatus.lastDisconnectReason}). Logged out: ${isLoggedOut}`);
+
+        if (isResettingAuth) return;
+
+        if (isLoggedOut) {
+          console.log('[WhatsApp] Session logged out. Clearing auth and generating a fresh QR...');
+          setTimeout(() => {
+            void resetWhatsAppAuth();
+          }, 2000);
+        } else {
+          setTimeout(() => {
+            void startWhatsAppBot();
+          }, 2000);
+        }
+      } else if (connection === 'open') {
+        waStatus.connected = true;
+        waStatus.qr = null;
+        waStatus.lastDisconnectReason = null;
+        console.log('✅ [GreenRoots Bot] Connected to WhatsApp WebSocket!');
+      }
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+      for (const msg of messages) {
+        await handleIncomingMessage(sock, msg);
+      }
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[WhatsApp Startup Error]', msg);
+    waStatus.connected = false;
+    waStatus.lastDisconnectReason = msg;
+    setTimeout(() => {
+      void startWhatsAppBot();
+    }, 5000);
+  }
 }
 
 // ─── Checkout expiry checker ──────────────────────────────────────────────────
@@ -1162,6 +1172,14 @@ startOrderExpiryChecker(
 startPayPalServer(() => activeSocket, {
   getStatus: () => waStatus,
   resetAuth: resetWhatsAppAuth,
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[Unhandled Rejection]', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Uncaught Exception]', err);
 });
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
