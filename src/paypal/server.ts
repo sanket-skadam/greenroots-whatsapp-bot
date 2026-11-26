@@ -1,4 +1,5 @@
 import express from 'express';
+import QRCode from 'qrcode';
 import type { WASocket } from '@whiskeysockets/baileys';
 import { config } from '../config.js';
 import { generateReceiptPdf } from '../features/receipt.js';
@@ -8,11 +9,105 @@ import { capturePayPalOrder, createFarmerPayout, inrToUsd } from './client.js';
 import { t } from '../i18n/messages.js';
 import { appendHistory, clearDrafts } from '../session.js';
 
-export function startPayPalServer(getSocket: () => WASocket | null): void {
+export interface WhatsAppStatus {
+  connected: boolean;
+  qr: string | null;
+  lastDisconnectReason: string | null;
+}
+
+export interface ServerControlOptions {
+  getStatus?: () => WhatsAppStatus;
+  resetAuth?: () => Promise<void>;
+}
+
+function isQrAuthorized(req: express.Request): boolean {
+  if (!config.qrAdminKey) return true;
+  return String(req.query.key ?? '') === config.qrAdminKey;
+}
+
+export function startPayPalServer(
+  getSocket: () => WASocket | null,
+  options?: ServerControlOptions
+): void {
   const app = express();
 
   app.get('/health', (_req, res) => {
-    res.json({ ok: true, service: 'greenroots-whatsapp-bot' });
+    const status = options?.getStatus?.();
+    res.json({
+      ok: true,
+      service: 'greenroots-whatsapp-bot',
+      whatsappConnected: status?.connected ?? false,
+    });
+  });
+
+  app.get('/qr', async (req, res) => {
+    if (!isQrAuthorized(req)) {
+      res.status(401).send('<h2>Unauthorized. Pass <code>?key=YOUR_QR_ADMIN_KEY</code>.</h2>');
+      return;
+    }
+
+    const status = options?.getStatus?.() ?? { connected: false, qr: null, lastDisconnectReason: null };
+    const keyQuery = config.qrAdminKey ? `?key=${encodeURIComponent(config.qrAdminKey)}` : '';
+
+    if (status.connected) {
+      res.send(`
+        <html>
+          <body style="font-family:system-ui,sans-serif;background:#f5f7fa;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;">
+            <div style="background:#fff;padding:32px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08);text-align:center;max-width:400px;">
+              <h2 style="color:#1B5E20;margin-top:0;">✅ WhatsApp Connected</h2>
+              <p style="color:#555;font-size:14px;">GreenRoots Bot is online and listening for messages.</p>
+              <a href="/qr/reset${keyQuery}" style="display:inline-block;margin-top:14px;padding:10px 18px;background:#d32f2f;color:#fff;text-decoration:none;border-radius:8px;font-size:14px;font-weight:600;">
+                Disconnect &amp; Generate New QR
+              </a>
+            </div>
+          </body>
+        </html>
+      `);
+      return;
+    }
+
+    if (status.qr) {
+      const qrDataUrl = await QRCode.toDataURL(status.qr, { width: 300, margin: 2 });
+      res.send(`
+        <html>
+          <head><meta http-equiv="refresh" content="8" /></head>
+          <body style="font-family:system-ui,sans-serif;background:#f5f7fa;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;">
+            <div style="background:#fff;padding:32px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08);text-align:center;max-width:400px;">
+              <h2 style="color:#1B5E20;margin-top:0;">🌱 GreenRoots WhatsApp Login</h2>
+              <p style="color:#555;font-size:14px;">Open WhatsApp → Linked Devices → Link a Device, and scan this QR code:</p>
+              <img src="${qrDataUrl}" alt="WhatsApp QR Code" style="width:260px;height:260px;border:1px solid #eee;border-radius:8px;" />
+              <p style="color:#888;font-size:12px;margin-top:12px;">Page refreshes automatically every 8 seconds.</p>
+            </div>
+          </body>
+        </html>
+      `);
+      return;
+    }
+
+    res.send(`
+      <html>
+        <head><meta http-equiv="refresh" content="3" /></head>
+        <body style="font-family:system-ui,sans-serif;background:#f5f7fa;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;">
+          <div style="background:#fff;padding:32px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.08);text-align:center;max-width:400px;">
+            <h2 style="margin-top:0;">⏳ Connecting to WhatsApp...</h2>
+            <p style="color:#555;font-size:14px;">${status.lastDisconnectReason ? `Last status: ${status.lastDisconnectReason}` : 'Waiting for QR code or session restore...'}</p>
+            <a href="/qr/reset${keyQuery}" style="display:inline-block;margin-top:12px;color:#0070ba;font-size:13px;">Force Fresh QR</a>
+          </div>
+        </body>
+      </html>
+    `);
+  });
+
+  app.get('/qr/reset', async (req, res) => {
+    if (!isQrAuthorized(req)) {
+      res.status(401).send('<h2>Unauthorized.</h2>');
+      return;
+    }
+    if (options?.resetAuth) {
+      await options.resetAuth();
+    }
+    const keyQuery = config.qrAdminKey ? `?key=${encodeURIComponent(config.qrAdminKey)}` : '';
+    res.redirect(`/qr${keyQuery}`);
   });
 
   app.get('/paypal/demo-checkout', (req, res) => {

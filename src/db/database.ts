@@ -86,7 +86,7 @@ export function getDb(): DatabaseSync {
 }
 
 export function initDatabase(dbPath?: string): DatabaseSync {
-  const target = dbPath ?? path.resolve(process.cwd(), 'data', 'greenroots.db');
+  const target = dbPath ?? (process.env.DB_PATH || path.resolve(process.cwd(), 'data', 'greenroots.db'));
   if (target !== ':memory:') {
     fs.mkdirSync(path.dirname(target), { recursive: true });
   }

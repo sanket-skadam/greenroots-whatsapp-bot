@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { Boom } from '@hapi/boom';
 import makeWASocket, {
   DisconnectReason,
@@ -9,6 +10,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
+import { config } from './config.js';
 
 import {
   classifyAndExtract,
@@ -36,11 +38,17 @@ import { findNearestCollectionPoint } from './features/location.js';
 
 import { LANGUAGE_NAMES, t } from './i18n/messages.js';
 import { createPayPalOrder, startOrderExpiryChecker } from './paypal/client.js';
-import { startPayPalServer } from './paypal/server.js';
+import { startPayPalServer, type WhatsAppStatus } from './paypal/server.js';
 import { appendHistory, clearDrafts } from './session.js';
 
-// ─── Active socket (shared with PayPal server) ───────────────────────────────
+// ─── Active socket & WhatsApp status (shared with Express server) ─────────────
 let activeSocket: WASocket | null = null;
+let isResettingAuth = false;
+const waStatus: WhatsAppStatus = {
+  connected: false,
+  qr: null,
+  lastDisconnectReason: null,
+};
 
 // ─── Per-user sequential queue (prevents race conditions) ────────────────────
 const userQueues = new Map<string, Promise<void>>();
@@ -1034,9 +1042,30 @@ async function handleIncomingMessage(sock: WASocket, msg: proto.IWebMessageInfo)
   debounceTimers.set(jid, timer);
 }
 
-// ─── WhatsApp Bot startup ─────────────────────────────────────────────────────
+// ─── WhatsApp Bot startup & auth reset ────────────────────────────────────────
+async function resetWhatsAppAuth(): Promise<void> {
+  if (isResettingAuth) return;
+  isResettingAuth = true;
+  try {
+    waStatus.connected = false;
+    waStatus.qr = null;
+    waStatus.lastDisconnectReason = 'Resetting session...';
+    try {
+      activeSocket?.end(undefined);
+    } catch {
+      // ignore socket close errors
+    }
+    activeSocket = null;
+    fs.rmSync(config.authDir, { recursive: true, force: true });
+    await startWhatsAppBot();
+  } finally {
+    isResettingAuth = false;
+  }
+}
+
 async function startWhatsAppBot(): Promise<void> {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  fs.mkdirSync(config.authDir, { recursive: true });
+  const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
@@ -1054,18 +1083,35 @@ async function startWhatsAppBot(): Promise<void> {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log('\n[GreenRoots Bot] Scan this QR code with WhatsApp (Linked Devices):');
+      waStatus.qr = qr;
+      waStatus.connected = false;
+      console.log('\n[GreenRoots Bot] Scan this QR code with WhatsApp (Linked Devices) or open /qr:');
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log(`[WhatsApp] Disconnected (code ${statusCode}). Reconnecting: ${shouldReconnect}`);
-      if (shouldReconnect) {
-        void startWhatsAppBot();
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+      waStatus.connected = false;
+      waStatus.lastDisconnectReason = statusCode ? `code ${statusCode}` : 'closed';
+      console.log(`[WhatsApp] Disconnected (${waStatus.lastDisconnectReason}). Logged out: ${isLoggedOut}`);
+
+      if (isResettingAuth) return;
+
+      if (isLoggedOut) {
+        console.log('[WhatsApp] Session logged out. Clearing auth and generating a fresh QR...');
+        setTimeout(() => {
+          void resetWhatsAppAuth();
+        }, 2000);
+      } else {
+        setTimeout(() => {
+          void startWhatsAppBot();
+        }, 2000);
       }
     } else if (connection === 'open') {
+      waStatus.connected = true;
+      waStatus.qr = null;
+      waStatus.lastDisconnectReason = null;
       console.log('✅ [GreenRoots Bot] Connected to WhatsApp WebSocket!');
     }
   });
@@ -1112,8 +1158,11 @@ startOrderExpiryChecker(
   }
 );
 
-// ─── PayPal server: expose getSocket so it can send WhatsApp messages ─────────
-startPayPalServer(() => activeSocket);
+// ─── PayPal server: expose getSocket & WhatsApp QR/status controls ───────────
+startPayPalServer(() => activeSocket, {
+  getStatus: () => waStatus,
+  resetAuth: resetWhatsAppAuth,
+});
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 void startWhatsAppBot();

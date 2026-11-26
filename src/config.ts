@@ -11,5 +11,8 @@ export const config = {
   port: Number(process.env.PORT ?? 3050),
   publicBaseUrl: process.env.PUBLIC_BASE_URL ?? `http://localhost:${process.env.PORT ?? 3050}`,
   inrPerUsd: Number(process.env.INR_PER_USD ?? 85),
+  authDir: process.env.AUTH_DIR ?? 'auth_info',
+  dbPath: process.env.DB_PATH ?? '',
+  qrAdminKey: process.env.QR_ADMIN_KEY ?? '',
 };
 
