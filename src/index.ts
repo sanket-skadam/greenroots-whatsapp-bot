@@ -44,6 +44,7 @@ import { appendHistory, clearDrafts } from './session.js';
 // ─── Active socket & WhatsApp status (shared with Express server) ─────────────
 let activeSocket: WASocket | null = null;
 let isResettingAuth = false;
+let reconnectTimer: NodeJS.Timeout | null = null;
 const waStatus: WhatsAppStatus = {
   connected: false,
   qr: null,
@@ -72,12 +73,18 @@ function extractText(msg: proto.IWebMessageInfo): string {
 }
 
 async function send(sock: WASocket, jid: string, text: string): Promise<void> {
-  await sock.sendMessage(jid, { text });
+  const target = activeSocket ?? sock;
+  await target.sendMessage(jid, { text });
 }
 
 async function react(sock: WASocket, msg: proto.IWebMessageInfo, emoji: string): Promise<void> {
   if (!msg.key.remoteJid) return;
-  await sock.sendMessage(msg.key.remoteJid, { react: { text: emoji, key: msg.key } });
+  try {
+    const target = activeSocket ?? sock;
+    await target.sendMessage(msg.key.remoteJid, { react: { text: emoji, key: msg.key } });
+  } catch {
+    // Reactions are best-effort; never fail message handling on a closed socket
+  }
 }
 
 function parseLanguageChoice(text: string): 'en' | 'hi' | 'pa' | 'mr' | null {
@@ -180,7 +187,11 @@ async function handleMessage(
   const upper = inputText?.toUpperCase().trim() ?? '';
 
   try {
-    await sock.sendPresenceUpdate('composing', jid);
+    try {
+      await (activeSocket ?? sock).sendPresenceUpdate('composing', jid);
+    } catch {
+      // Presence update is best-effort
+    }
 
     // ── Slash commands (available from MENU step onward) ──────────────────────
     if (upper === '/RESET' || upper === '/START') {
@@ -832,7 +843,11 @@ async function handleMessage(
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : 'Unexpected error';
     console.error('[Bot Error]', errMsg);
-    await send(sock, jid, t(user.language, 'generic_error'));
+    try {
+      await send(sock, jid, t(user.language, 'generic_error'));
+    } catch (sendErr) {
+      console.error('[Bot Send Error]', sendErr instanceof Error ? sendErr.message : sendErr);
+    }
   }
 }
 
@@ -1063,12 +1078,25 @@ async function resetWhatsAppAuth(): Promise<void> {
   }
 }
 
+function scheduleReconnect(delayMs = 2000): void {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    void startWhatsAppBot();
+  }, delayMs);
+}
+
 async function startWhatsAppBot(): Promise<void> {
   try {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     fs.mkdirSync(config.authDir, { recursive: true });
     const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
     const { version } = await fetchLatestBaileysVersion();
 
+    const prevSocket = activeSocket;
     const sock = makeWASocket({
       version,
       auth: state,
@@ -1077,10 +1105,16 @@ async function startWhatsAppBot(): Promise<void> {
     });
 
     activeSocket = sock;
+    try {
+      prevSocket?.end(undefined);
+    } catch {
+      // ignore closing superseded socket
+    }
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
+      if (activeSocket !== sock) return;
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
@@ -1105,9 +1139,7 @@ async function startWhatsAppBot(): Promise<void> {
             void resetWhatsAppAuth();
           }, 2000);
         } else {
-          setTimeout(() => {
-            void startWhatsAppBot();
-          }, 2000);
+          scheduleReconnect(2000);
         }
       } else if (connection === 'open') {
         waStatus.connected = true;
@@ -1118,7 +1150,7 @@ async function startWhatsAppBot(): Promise<void> {
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
+      if (activeSocket !== sock || type !== 'notify') return;
       for (const msg of messages) {
         await handleIncomingMessage(sock, msg);
       }
@@ -1128,9 +1160,7 @@ async function startWhatsAppBot(): Promise<void> {
     console.error('[WhatsApp Startup Error]', msg);
     waStatus.connected = false;
     waStatus.lastDisconnectReason = msg;
-    setTimeout(() => {
-      void startWhatsAppBot();
-    }, 5000);
+    scheduleReconnect(5000);
   }
 }
 
