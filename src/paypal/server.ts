@@ -272,7 +272,7 @@ export function startPayPalServer(
     res.send('<h2>Checkout cancelled. You may close this window and return to WhatsApp.</h2>');
   });
 
-  app.listen(config.port, () => {
-    console.log(`[PayPal Server] Listening on ${config.publicBaseUrl}`);
+  app.listen(config.port, '0.0.0.0', () => {
+    console.log(`[PayPal Server] Listening on 0.0.0.0:${config.port} (${config.publicBaseUrl})`);
   });
 }
